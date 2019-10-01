@@ -43,6 +43,16 @@ namespace NetTopologySuite.OffsetCurve
             return d.GetResult(start, end);
         }
 
+        /// <summary>
+        /// Finds the shortest path through a Linear geometry from start to end.
+        /// </summary>
+        public static Geometry FindPathPq(Geometry g, Coordinate start, Coordinate end)
+        {
+            var d = new ShortestPath();
+            d.Add(g);
+            return d.GetResultPq(start, end);
+        }
+
         private Geometry _result;
         private GeometryFactory _factory;
 
@@ -50,6 +60,7 @@ namespace NetTopologySuite.OffsetCurve
         private readonly EdgeGraph.EdgeGraph _graph;
         private Node _startNode;
         private Node _endNode;
+        private readonly Dictionary<Coordinate, PriorityQueueNode<Node, Node>> _nodeMapPq;
         private readonly Dictionary<Coordinate, Node> _nodeMap;
 
         /// <summary>
@@ -57,7 +68,8 @@ namespace NetTopologySuite.OffsetCurve
         /// </summary>
         public ShortestPath()
         {
-            _nodeMap = new Dictionary<Coordinate, Node>();
+            _nodeMapPq = new Dictionary<Coordinate, PriorityQueueNode<Node, Node>>();
+            _nodeMap = new Dictionary<Coordinate, Node>(); 
             _graph = new EdgeGraph.EdgeGraph();
         }
 
@@ -125,20 +137,42 @@ namespace NetTopologySuite.OffsetCurve
             return _result;
         }
 
+        /// <summary>
+        /// Gets the dissolved result as a MultiLineString.
+        /// </summary>
+        /// <returns>
+        /// the dissolved lines
+        /// </returns>
+        public Geometry GetResultPq(Coordinate start, Coordinate end)
+        {
+            if (_result == null)
+                ComputeResultPq(start, end);
+            return _result;
+        }
+
         private void ComputeResult(Coordinate start, Coordinate end)
         {
 
             BuildNodes(start, end);
             FindShortestPath();
-            var path = tracePath();
+            var path = TracePath();
             _result = BuildLine(path);
         }
 
-/**
- * Extract shortest path by backtracing shortest link pointers on nodes
- * @return
- */
-        private List<Node> tracePath()
+        private void ComputeResultPq(Coordinate start, Coordinate end)
+        {
+
+            BuildNodesPq(start, end);
+            FindShortestPathPq();
+            var path = TracePath();
+            _result = BuildLine(path);
+        }
+
+        /// <summary>
+        /// Extract shortest path by backtracing shortest link pointers on nodes
+        /// </summary>
+        /// <returns></returns>
+        private List<Node> TracePath()
         {
             var path = new List<Node>();
             var node = _endNode;
@@ -157,8 +191,10 @@ namespace NetTopologySuite.OffsetCurve
             var coords = new CoordinateList();
             foreach (var n in path)
             {
-                coords.Add(n.Coordinate, false);
+                if (coords.Count == 0 || !coords[0].Equals(n.Coordinate))
+                    coords.Insert(0, n.Coordinate);
             }
+
             return _factory.CreateLineString(coords.ToCoordinateArray());
         }
 
@@ -166,28 +202,25 @@ namespace NetTopologySuite.OffsetCurve
         {
 
             var path = new List<Node>();
-            var uncommitted = new HashSet<Node>();
-            var priorityQueue = new PriorityQueue<Node>();
-            foreach (var value in _nodeMap.Values)
+            var priorityQueue = new AlternativePriorityQueue<Node, Node>();
+            foreach (var value in _nodeMapPq.Values)
             {
-                priorityQueue.Add(value);
-                uncommitted.Add(value);
+                priorityQueue.Enqueue(value, value.Data);
             }
 
-            var currentNode = priorityQueue.Poll();
+            var currentNode = priorityQueue.Dequeue();
             while (true)
             {
-                currentNode.SetMark(true);
-                UpdateNeighbours(currentNode, uncommitted);
+                currentNode.Data.SetMark(true);
+                UpdateNeighboursPq(currentNode.Data, priorityQueue);
 
-                currentNode = priorityQueue.Poll();
-                uncommitted.Remove(currentNode);
+                currentNode = priorityQueue.Dequeue();
                 if (currentNode == null)
                 {
                     break;
                 }
 
-                if (currentNode.Coordinate.Equals2D(_endNode.Coordinate))
+                if (currentNode.Data.Coordinate.Equals2D(_endNode.Coordinate))
                 {
                     break;
                 }
@@ -254,14 +287,34 @@ namespace NetTopologySuite.OffsetCurve
             } while (next != start);
         }
 
+        private void UpdateNeighboursPq(Node currentNode, AlternativePriorityQueue<Node, Node> uncommitted)
+        {
+            var start = currentNode.Edge;
+            double currentDistance = currentNode.Distance;
+            var next = start;
+            do
+            {
+                var pqn = FindPqNode(next.Dest);
+                if (uncommitted.Contains(pqn))
+                {
+                    var n = pqn.Data;
+                    double distToNodeFromCurrent = currentNode.Coordinate.Distance(n.Coordinate);
+                    double dist = distToNodeFromCurrent + currentDistance;
+                    if (dist < n.Distance)
+                    {
+                        n.Distance = dist;
+                        n.NearestOnPath = currentNode;
+                        uncommitted.ChangePriority(pqn, n);
+                    }
+                }
+
+                next = next.ONext;
+            } while (next != start);
+        }
+
         private Node FindNode(Coordinate dest)
         {
             return _nodeMap[dest];
-        }
-
-        private Node NearestPq(PriorityQueue<Node> nodes)
-        {
-            return nodes.Poll();
         }
 
         private Node Nearest(ISet<Node> nodes)
@@ -274,7 +327,13 @@ namespace NetTopologySuite.OffsetCurve
                     nearest = n;
                 }
             }
+
             return nearest;
+        }
+
+        private PriorityQueueNode<Node, Node> FindPqNode(Coordinate dest)
+        {
+            return _nodeMapPq[dest];
         }
 
         private void BuildNodes(Coordinate start, Coordinate end)
@@ -296,5 +355,26 @@ namespace NetTopologySuite.OffsetCurve
                 }
             }
 
+        }
+        private void BuildNodesPq(Coordinate start, Coordinate end)
+        {
+            var edges = _graph.GetVertexEdges();
+            foreach (var e in edges)
+            {
+                var node = new Node(e);
+                node.Distance = double.PositiveInfinity;
+                _nodeMapPq.Add(node.Coordinate, new PriorityQueueNode<Node, Node>(node));
+                if (node.Coordinate.Equals2D(start))
+                {
+                    _startNode = node;
+                    node.Distance = 0;
+                }
+                else if (node.Coordinate.Equals2D(end))
+                {
+                    _endNode = node;
+                }
+            }
+
+        }
     }
 }
